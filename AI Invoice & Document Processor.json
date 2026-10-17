@@ -1,0 +1,662 @@
+{
+  "name": "AI Invoice & Document Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "process-document",
+        "options": {
+          "binaryPropertyName": "data",
+          "rawBody": true
+        }
+      },
+      "id": "b85e1dd2-2fb7-406c-ade9-9c0cdeca0c21",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1216,
+        416
+      ],
+      "webhookId": "866e2723-c648-47ab-9747-2bf83be3e0c2"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "2ce727d3-df51-4e0a-a8f8-f312fa8c6bd0",
+      "name": "Email Trigger (IMAP)",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        -1216,
+        608
+      ],
+      "notes": "Alternative trigger: watches inbox for emails with invoice attachments."
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const body = item.json.body ?? {};\n  const headers = item.json.headers ?? {};\n\n  let fileData = body.file_base64 ?? null;\n  let fileName = body.file_name ?? 'document';\n  let mimeType = body.mime_type ?? '';\n\n  const binaryKey = Object.keys(item.binary ?? {})[0];\n\n  if (binaryKey) {\n    const binary = item.binary[binaryKey];\n    const buffer = await this.helpers.getBinaryDataBuffer(i, binaryKey);\n\n    fileData = buffer.toString('base64');\n    fileName = binary.fileName || fileName;\n    mimeType = binary.mimeType || mimeType;\n  }\n\n  if (!fileData) {\n    throw new Error('No document found in the input.');\n  }\n\n  if (!mimeType || mimeType === 'application/json') {\n    const ext = fileName.split('.').pop().toLowerCase();\n\n    mimeType = {\n      png: 'image/png',\n      jpg: 'image/jpeg',\n      jpeg: 'image/jpeg',\n      webp: 'image/webp'\n    }[ext] || 'application/octet-stream';\n  }\n\n  results.push({\n    json: {\n      fileData,\n      fileName,\n      mimeType,\n      source: 'webhook-upload',\n      receivedAt: new Date().toISOString()\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "0155f46f-c412-4701-912f-79470d3ef531",
+      "name": "Extract File Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -992,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const aiResponse = $input.first().json.output?.[0]?.content?.[0]?.text;\n\nif (!aiResponse || typeof aiResponse !== 'object') {\n  throw new Error('AI did not return a structured invoice object.');\n}\n\nconst fileInfo = $('Extract File Data').first().json;\n\nconst isInvoice =\n  String(aiResponse.document_type ?? '').trim().toLowerCase() === 'invoice';\n\nconst hasVendor = Boolean(aiResponse.vendor?.name?.trim());\nconst hasInvoiceNumber = Boolean(aiResponse.invoice_number?.trim());\nconst hasDate = Boolean(aiResponse.invoice_date?.trim());\n\nconst hasTotal =\n  typeof aiResponse.total === 'number' &&\n  Number.isFinite(aiResponse.total);\n\nconst lineItems = aiResponse.line_items;\n\nconst hasLineItems =\n  Array.isArray(lineItems) &&\n  lineItems.length > 0 &&\n  lineItems.every(item =>\n    typeof item.description === 'string' &&\n    item.description.trim() !== '' &&\n    Number.isFinite(item.quantity) &&\n    item.quantity > 0 &&\n    Number.isFinite(item.unit_price) &&\n    item.unit_price >= 0 &&\n    Number.isFinite(item.total) &&\n    item.total >= 0\n  );\n\nconst lineItemsConsistent =\n  hasLineItems &&\n  lineItems.every(item =>\n    Math.abs(item.quantity * item.unit_price - item.total) <= 0.05\n  );\n\nconst hasFinancialValues = [\n  aiResponse.subtotal,\n  aiResponse.tax_amount,\n  aiResponse.discount,\n  aiResponse.total\n].every(Number.isFinite);\n\nconst expectedTotal =\n  aiResponse.subtotal +\n  aiResponse.tax_amount -\n  aiResponse.discount;\n\nconst totalsConsistent =\n  hasFinancialValues &&\n  Math.abs(expectedTotal - aiResponse.total) <=\n    Math.max(0.05, Math.abs(aiResponse.total) * 0.01);\n\nconst validation = {\n  isInvoice,\n  hasVendor,\n  hasInvoiceNumber,\n  hasDate,\n  hasTotal,\n  hasLineItems,\n  lineItemsConsistent,\n  totalsConsistent\n};\n\nconst validFieldCount = [\n  hasVendor,\n  hasInvoiceNumber,\n  hasDate,\n  hasTotal,\n  hasLineItems\n].filter(Boolean).length;\n\nconst needsReview = !(\n  isInvoice &&\n  validFieldCount === 5 &&\n  lineItemsConsistent &&\n  totalsConsistent\n);\n\nconst dataQuality = needsReview\n  ? validFieldCount >= 3 ? 'medium' : 'low'\n  : 'high';\n\nreturn [{\n  json: {\n    ...aiResponse,\n    _metadata: {\n      fileName: fileInfo.fileName,\n      source: fileInfo.source,\n      processedAt: new Date().toISOString(),\n      dataQuality,\n      needsReview,\n      validation\n    }\n  }\n}];"
+      },
+      "id": "eff25cd1-3990-4d4a-8fae-460d480eca66",
+      "name": "Validate & Enrich",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "db3c2225-396b-440a-b968-ddbfeecbec04",
+              "leftValue": "={{ $json._metadata.needsReview }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e1ef37d9-8b00-4b81-a39c-4022b65447f5",
+      "name": "Needs Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "select": "user",
+        "user": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "text": "Invoice Needs Review\\nFile: {{ $json._metadata.fileName }}\\nVendor: {{ $json.vendor?.name || 'Unknown' }}\\nTotal: {{ $json.currency }} {{ $json.total || 'Unknown' }}\\nQuality: {{ $json._metadata.dataQuality }}",
+        "otherOptions": {}
+      },
+      "id": "32811ce0-368d-4991-9627-362bb5d19079",
+      "name": "Flag for Review (Slack)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        32,
+        416
+      ],
+      "webhookId": "2bd04cff-ec72-4099-a0fd-c92daaf5d283",
+      "credentials": {
+        "slackApi": {
+          "id": "3mV6kpBzLpsjK2S7",
+          "name": "Markviilabs 3.13am"
+        }
+      },
+      "notes": "Notifies team when invoice needs manual review."
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0C88T79H7G",
+          "mode": "list",
+          "cachedResultName": "test-1"
+        },
+        "text": "=Vendor: {{ $('Validate & Enrich').item.json.vendor.name }} \nInvoice No.: {{ $('Validate & Enrich').item.json.invoice_number }} \nAmount: {{ $('Validate & Enrich').item.json.currency }} {{ $('Validate & Enrich').item.json.total }} \nFile: {{ $('Validate & Enrich').item.json._metadata.fileName }} \nSource: {{ $('Validate & Enrich').item.json._metadata.source }}  \n\nZoho Books bill creation completed successfully.",
+        "otherOptions": {}
+      },
+      "id": "47898c5e-3052-44f0-9723-f40970e08818",
+      "name": "Notify Success (Slack)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1600,
+        608
+      ],
+      "webhookId": "6b6bb30a-d3c5-4be4-883d-d98c44a80246",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "3mV6kpBzLpsjK2S7",
+          "name": "Markviilabs 10/11/2026 (3.21am)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "Extract the following fields from this invoice/receipt image and return ONLY valid JSON, no other text:\n\n{\n  \"document_type\": \"invoice | receipt | purchase_order | quote | credit_note\",\n  \"vendor\": { \"name\": \"\", \"address\": \"\", \"email\": \"\", \"phone\": \"\", \"tax_id\": \"\" },\n  \"customer\": { \"name\": \"\", \"address\": \"\", \"email\": \"\" },\n  \"invoice_number\": \"\",\n  \"invoice_date\": \"\",\n  \"due_date\": \"\",\n  \"line_items\": [{ \"description\": \"\", \"quantity\": 0, \"unit_price\": 0, \"total\": 0 }],\n  \"subtotal\": 0,\n  \"tax_rate\": 0,\n  \"tax_amount\": 0,\n  \"discount\": 0,\n  \"total\": 0,\n  \"currency\": \"\",\n  \"payment_terms\": \"\",\n  \"payment_method\": \"\"\n}"
+            },
+            {
+              "type": "image",
+              "imageUrl": "={{ 'data:' + $json.mimeType + ';base64,' + $json.fileData }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {
+          "textFormat": {
+            "textOptions": {
+              "type": "json_schema",
+              "schema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"document_type\": { \"type\": \"string\" },\n    \"vendor\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"name\": { \"type\": \"string\" },\n        \"address\": { \"type\": \"string\" },\n        \"email\": { \"type\": \"string\" },\n        \"phone\": { \"type\": \"string\" },\n        \"tax_id\": { \"type\": \"string\" }\n      },\n      \"required\": [\"name\", \"address\", \"email\", \"phone\", \"tax_id\"],\n      \"additionalProperties\": false\n    },\n    \"customer\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"name\": { \"type\": \"string\" },\n        \"address\": { \"type\": \"string\" },\n        \"email\": { \"type\": \"string\" }\n      },\n      \"required\": [\"name\", \"address\", \"email\"],\n      \"additionalProperties\": false\n    },\n    \"invoice_number\": { \"type\": \"string\" },\n    \"invoice_date\": { \"type\": \"string\" },\n    \"due_date\": { \"type\": \"string\" },\n    \"line_items\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"description\": { \"type\": \"string\" },\n          \"quantity\": { \"type\": \"number\" },\n          \"unit_price\": { \"type\": \"number\" },\n          \"total\": { \"type\": \"number\" }\n        },\n        \"required\": [\"description\", \"quantity\", \"unit_price\", \"total\"],\n        \"additionalProperties\": false\n      }\n    },\n    \"subtotal\": { \"type\": \"number\" },\n    \"tax_rate\": { \"type\": \"number\" },\n    \"tax_amount\": { \"type\": \"number\" },\n    \"discount\": { \"type\": \"number\" },\n    \"total\": { \"type\": \"number\" },\n    \"currency\": { \"type\": \"string\" },\n    \"payment_terms\": { \"type\": \"string\" },\n    \"payment_method\": { \"type\": \"string\" }\n  },\n  \"required\": [\n    \"document_type\",\n    \"vendor\",\n    \"customer\",\n    \"invoice_number\",\n    \"invoice_date\",\n    \"due_date\",\n    \"line_items\",\n    \"subtotal\",\n    \"tax_rate\",\n    \"tax_amount\",\n    \"discount\",\n    \"total\",\n    \"currency\",\n    \"payment_terms\",\n    \"payment_method\"\n  ],\n  \"additionalProperties\": false\n}"
+            }
+          }
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        -768,
+        512
+      ],
+      "id": "e0fdfc0f-0ac0-4170-8336-f517447d23b0",
+      "name": "Message a model",
+      "credentials": {
+        "openAiApi": {
+          "id": "yCU7tiF7vQAtYXoo",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.in/books/v3/bills",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "organization_id",
+              "value": "60091536012"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Zoho-oauthtoken 1000.f5cc8ad346d48c171bcd75985b773550.99d79bbe82b8f9f489d1c139b2d096f8"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"vendor_id\": \"{{ $json.vendor_id }}\",\n  \"bill_number\": \"{{ $('Validate & Enrich').item.json.invoice_number }}\",\n  \"date\":\"{{ DateTime.fromFormat($('Validate & Enrich').item.json.invoice_date, 'MMM dd, yyyy').toFormat('yyyy-MM-dd') }}\",\n  \"due_date\": \"{{ DateTime.fromFormat($('Validate & Enrich').item.json.due_date, 'MMM dd, yyyy').toFormat('yyyy-MM-dd') }}\",\n  \"line_items\": {{ JSON.stringify(\n  $('Validate & Enrich').item.json.line_items.map(item => ({\n    name: item.description,\n    rate: item.unit_price,\n    quantity: item.quantity,\n    account_id: \"430807100000000570\"\n  }))\n) }}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1376,
+        608
+      ],
+      "id": "2aafbfd9-5b40-498a-835b-71c2483aa3c2",
+      "name": "HTTP Request- ZOHO BOOKS"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "84825c78-754c-416e-bfff-dc39781118f3",
+              "leftValue": "={{ $json.contacts.some(c => (c.vendor_name || c.contact_name || '').trim().toLowerCase() === $('Validate & Enrich').item.json.vendor.name.trim().toLowerCase()) }}",
+              "rightValue": "=true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        256,
+        608
+      ],
+      "id": "27ba9133-1705-4e4f-a322-1d30e7f78751",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "url": "https://www.zohoapis.in/books/v3/contacts",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "organization_id",
+              "value": "60091536012"
+            },
+            {
+              "name": "contact_type",
+              "value": "vendor"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Zoho-oauthtoken 1000.f5cc8ad346d48c171bcd75985b773550.99d79bbe82b8f9f489d1c139b2d096f8"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        32,
+        608
+      ],
+      "id": "70e4d954-92d4-4322-9505-d670a716dc3e",
+      "name": "Find if Vendor is already existing in Zoho Books"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://www.zohoapis.in/books/v3/contacts",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "organization_id",
+              "value": "60091536012"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Zoho-oauthtoken 1000.f5cc8ad346d48c171bcd75985b773550.99d79bbe82b8f9f489d1c139b2d096f8"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contact_name\": \"{{ $('Validate & Enrich').item.json.vendor.name }}\",\n  \"contact_type\": \"vendor\",\n  \"billing_address\": {\n    \"address\": \"{{ $('Validate & Enrich').item.json.vendor.address }}\"\n  }\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        480,
+        704
+      ],
+      "id": "da6e1dae-b3f6-4437-bb2c-028bf6570f1e",
+      "name": "Create Vendor in Zoho Books"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c437362c-09d4-43d5-b598-a6d5d485daed",
+              "name": "vendor_id",
+              "value": "={{ $json.contact.contact_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        704,
+        704
+      ],
+      "id": "7d2b3059-5a30-4ef7-89af-75a605b57121",
+      "name": "Prepare New Vendor ID"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c437362c-09d4-43d5-b598-a6d5d485daed",
+              "name": "vendor_id",
+              "value": "={{ $json.contacts.find(c => (c.vendor_name || c.contact_name || '').trim().toLowerCase() === $('Validate & Enrich').item.json.vendor.name.trim().toLowerCase())?.contact_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        592,
+        512
+      ],
+      "id": "a4e4f9de-0dc1-4c83-8353-5cb71273b111",
+      "name": "Prepare Exisitind Vendor ID"
+    },
+    {
+      "parameters": {
+        "url": "https://www.zohoapis.in/books/v3/contacts",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        928,
+        608
+      ],
+      "id": "c8bc2d77-8885-4499-9b70-ddb881f214a7",
+      "name": "Find If Already Bill Exists"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ec69550c-4695-43cc-890e-f8416442a856",
+              "leftValue": "",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1152,
+        608
+      ],
+      "id": "48c88860-7917-4e05-9063-b9be3f459e4f",
+      "name": "If Duplicate Exists"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract File Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Trigger (IMAP)": {
+      "main": [
+        [
+          {
+            "node": "Extract File Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Enrich": {
+      "main": [
+        [
+          {
+            "node": "Needs Review?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Review?": {
+      "main": [
+        [
+          {
+            "node": "Flag for Review (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find if Vendor is already existing in Zoho Books",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract File Data": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Validate & Enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request- ZOHO BOOKS": {
+      "main": [
+        [
+          {
+            "node": "Notify Success (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Prepare Exisitind Vendor ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Vendor in Zoho Books",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find if Vendor is already existing in Zoho Books": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Vendor in Zoho Books": {
+      "main": [
+        [
+          {
+            "node": "Prepare New Vendor ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag for Review (Slack)": {
+      "main": [
+        []
+      ]
+    },
+    "Prepare Exisitind Vendor ID": {
+      "main": [
+        [
+          {
+            "node": "Find If Already Bill Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Success (Slack)": {
+      "main": [
+        []
+      ]
+    },
+    "Prepare New Vendor ID": {
+      "main": [
+        [
+          {
+            "node": "Find If Already Bill Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find If Already Bill Exists": {
+      "main": [
+        [
+          {
+            "node": "If Duplicate Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Duplicate Exists": {
+      "main": [
+        [],
+        [
+          {
+            "node": "HTTP Request- ZOHO BOOKS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "48c65074-9d84-40d8-9b71-3b2c989cddf9",
+  "meta": {
+    "instanceId": "47266411f6c0054e6b64daeecc8d3e95b887bd6aed07fe548d33e84ff3ae6670"
+  },
+  "nodeGroups": [],
+  "id": "LHTvF9fR3nioVopz",
+  "tags": [
+    {
+      "updatedAt": "2026-09-16T10:44:02.100Z",
+      "createdAt": "2026-09-16T10:44:02.100Z",
+      "id": "Z5Crdp5DneBAxOqN",
+      "name": "automation"
+    },
+    {
+      "updatedAt": "2026-09-16T10:44:02.108Z",
+      "createdAt": "2026-09-16T10:44:02.108Z",
+      "id": "143Cs7Ow1FfripCH",
+      "name": "invoice"
+    },
+    {
+      "updatedAt": "2026-09-16T10:44:02.109Z",
+      "createdAt": "2026-09-16T10:44:02.109Z",
+      "id": "YZrietDlrqKcxQ8i",
+      "name": "ai"
+    },
+    {
+      "updatedAt": "2026-09-16T10:44:02.113Z",
+      "createdAt": "2026-09-16T10:44:02.113Z",
+      "id": "s8pqpOCPtdulgAWr",
+      "name": "document-processing"
+    }
+  ]
+}
